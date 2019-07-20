@@ -45,7 +45,6 @@ static const uint64_t RECORD_SIZE = 4096;
 static const size_t RAM_AVAILABLE = RECORD_SIZE * 4; // TODO nie to
 static vector <string> records{}; // each of size RECORD_SIZE
 
-
 // możemy czytać bezpiecznie do `read_to - 1`
 future<> read_records(file f, uint64_t start_from, uint64_t read_to) {
     if (read_to < start_from + RECORD_SIZE) {
@@ -80,7 +79,6 @@ future<> read_chunk(file f, uint64_t pos, uint64_t fsize) {
 
 future<> dump_records(file f, uint64_t num_record = 0) {
     uint64_t write_pos = num_record * RECORD_SIZE;
-    cerr << records.size() << "\n";
     if (num_record > records.size() - 1)
         return make_ready_future();
     return f.dma_write<char>(write_pos, records[num_record].c_str(), RECORD_SIZE).then([=](size_t num) {
@@ -92,18 +90,21 @@ future<> dump_records(file f, uint64_t num_record = 0) {
 
 future<> dump_sorted_chunk(uint64_t num_chunk) {
     sstring fname = sstring(TMP_DIR + string("chunk") + to_string(num_chunk));
+//    cerr << records.size() << "\n";
     return open_file_dma(fname, open_flags::rw | open_flags::create).then([](file f) {
         return dump_records(f);
     });
 }
 
-future<> handle_chunks(file f, uint64_t fsize, uint64_t num_chunk = 0) {
+
+// returns max. chunk number, ie 6 for created chunk0, chunk1, ..., chunk6 (7 files created)
+future<int> handle_chunks(file f, uint64_t fsize, uint64_t num_chunk = 0) {
     records.clear();
     uint64_t start_from = num_chunk * RAM_AVAILABLE;
 //    if (start_from + RAM_AVAILABLE > fsize)
 //        return make_ready_future();
     if (start_from >= fsize)
-        return make_ready_future();
+        return make_ready_future<int>(num_chunk);
     return read_chunk(f, start_from, fsize).then([=](){
         sort(records.begin(), records.end());
         return dump_sorted_chunk(num_chunk).then([=] () {
@@ -131,11 +132,6 @@ int compute(int argc, char **argv) {
         std::cerr << "Couldn't start application: ";
         return 1;
     }
-
-//    for (string el : records) {
-//        cout << 'X' << el << 'X' << "\n";
-//    }
-//    cout << records.size() << endl;
     return 0;
 }
 
