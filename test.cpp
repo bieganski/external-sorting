@@ -6,6 +6,7 @@
 #include "seastar/core/sstring.hh"
 // #include "seastar/core/aligned_buffer.hh"
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/future-util.hh>
 
 #include <iostream>
 #include <stdexcept>
@@ -52,6 +53,10 @@ using recordContainer = vector <string>;
 
 static recordContainer RECORDS{}; // used in splitting-into-chunks preproccessing phase for keeping records to be dumped
 
+static vector<recordContainer> CHUNKS; // used in merging phase, they contain
+
+static recordContainer OUTPUT_CHUNK; // contains part of resulting file (it is to-be-concatenate)
+
 // możemy czytać bezpiecznie do `read_to - 1`
 future<> read_records(file f, recordContainer *save_to, uint64_t start_from, uint64_t read_to) {
     if (read_to < start_from + RECORD_SIZE) {
@@ -91,7 +96,7 @@ future<> read_records(file f, recordContainer *save_to, uint64_t start_from, uin
 // zatem read_to w funkcji wyżej musi być pos + RAM_AVAILABLE (bo read() czyta do read_to - 1)
 future<> read_chunk(file f, uint64_t pos, uint64_t fsize) {
     assert(RECORDS.empty());
-    uint64_t read_to = read_to = min(pos + RAM_AVAILABLE, fsize);
+    uint64_t read_to = min(pos + RAM_AVAILABLE, fsize);
 //    pos + RAM_AVAILABLE;
 //    if (read_to > fsize) {
 //        return make_ready_future();
@@ -112,12 +117,12 @@ future<> dump_records(file f, uint64_t num_record = 0) {
 }
 
 
-inline sstring chunk_name(uint64_t num_chunk) {
+inline sstring chunk_fname(uint64_t num_chunk) {
     return sstring(TMP_DIR + string("chunk") + to_string(num_chunk));
 }
 
 future<> dump_sorted_chunk(uint64_t num_chunk) {
-    sstring fname = chunk_name(num_chunk);
+    sstring fname = chunk_fname(num_chunk);
 //    cerr << records.size() << "\n";
     return open_file_dma(fname, open_flags::rw | open_flags::create).then([](file f) {
         return dump_records(f);
@@ -134,7 +139,9 @@ future<uint64_t> handle_chunks(file f, uint64_t fsize, uint64_t num_chunk = 0) {
     if (start_from >= fsize)
         return make_ready_future<uint64_t>(num_chunk);
     return read_chunk(f, start_from, fsize).then([=](){
-        sort(RECORDS.begin(), RECORDS.end());
+        // sorting order is reversed, because it is easier to
+        // handle merge sort in further steps
+        sort(RECORDS.begin(), RECORDS.end(), greater<string>());
         return dump_sorted_chunk(num_chunk).then([=] () {
 //            cerr << "chunk nr " << num_chunk << ": zdumpowano " << records.size() << " rekordów.\n";
             return handle_chunks(f, fsize, num_chunk + 1);
@@ -142,16 +149,74 @@ future<uint64_t> handle_chunks(file f, uint64_t fsize, uint64_t num_chunk = 0) {
     });
 }
 
+future<> read_specific_record_num(file f, uint64_t fsize, recordContainer *save_to,
+        uint64_t num_rec, uint64_t start_reading_from_rec = 0) {
+
+    uint64_t start_pos = start_reading_from_rec * RECORD_SIZE;
+    uint64_t read_to = min(fsize, start_pos + num_rec * RECORD_SIZE);
+    return read_records(f, save_to, start_pos, read_to);
+}
+
+/**
+ * @param chunk number of chunk we read from
+ * @param num_records number of records to be read
+ * @param starting_record record we start reading from
+ */
+future<> read_chunk_file(uint64_t chunk, uint64_t num_records, uint64_t starting_record) {
+    sstring fname = chunk_fname(chunk);
+    return open_file_dma(fname, open_flags::rw).then([=](file f) mutable {
+        return f.size().then([=](uint64_t fsize) mutable {
+            CHUNKS[chunk].clear(); // TODO
+            return read_specific_record_num(f, fsize, &CHUNKS[chunk], num_records, starting_record);
+        });
+    });
+}
+
+
+future<stop_iteration> dump_output();
+
+future<stop_iteration> extract_min() {
+    uint64_t min_idx = -1;
+    bool sth_left = false;
+    for (uint64_t i = 0; i < CHUNKS.size(); i++) {
+        if (!CHUNKS[i].empty()) {
+            sth_left = true;
+            if (min_idx < 0) {
+                min_idx = i;
+            } else if (CHUNKS[i].back() < CHUNKS[min_idx].back()) {
+                min_idx = i;
+            }
+        }
+    }
+    if (!sth_left)
+        return make_ready_future<stop_iteration>(stop_iteration::yes);
+    OUTPUT_CHUNK.emplace_back(CHUNKS[min_idx].back());
+    CHUNKS[min_idx].pop_back();
+    if (CHUNKS[min_idx].empty()) {
+        // need to load more data from disc
+    }
+    if (OUTPUT_CHUNK.size() == MERGED_BLOCK_SIZE) {
+        return dump_output();
+    }
+    return make_ready_future<stop_iteration>(stop_iteration::no);
+}
+
 /**
  * Plik wejśćiowy mamy podzielony na bloki o rozmiarze maksymalnie RAM_AVAILABLE (./tmp/chunkN),
  * w fazie mergowania bierzemy po kawałku każdego z bloków, następnie szukamy elementów
  * globalnie najmniejszych, które dołączamy do wynikowego bloku, który następnie zapiszemy na dysk
  * (wynikowy plik jest konkatenacją tychże bloków)
+ * @param chunks ilośc stworzonych plików chunksN
  * @return wektor nazw plików, które należy skonkatenować, by otrzymać posortowany plik wejściowy.
  */
 future<> merge_phase(uint64_t chunks) {
-    uint64_t recs_per_chunk =
-    return make_ready_future<>();
+    uint64_t RAM_FOR_CHUNKS = RAM_AVAILABLE - MERGED_BLOCK_SIZE;
+    uint64_t recs_per_chunk = RAM_FOR_CHUNKS / chunks;
+    assert(recs_per_chunk > 0);
+    CHUNKS = vector<recordContainer>{chunks};
+    OUTPUT_CHUNK = recordContainer{0};
+    return repeat(extract_min);
+//    return make_ready_future<vector<string>>(); TODO vector<string>
 }
 
 future<> f() {
