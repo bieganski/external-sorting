@@ -236,7 +236,9 @@ future<> merge_phase(uint64_t chunks) {
     CHUNKS = vector<recordContainer>{chunks};
     TO_BE_TAKEN = vector<uint64_t>{chunks};
     OUTPUT_BATCH = recordContainer();
-    return repeat(extract_min);
+    return init_merge_phase(chunks).then([](){
+        return repeat(extract_min);
+    });
 //    return make_ready_future<vector<string>>(); TODO vector<string>
 }
 
