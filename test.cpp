@@ -80,23 +80,6 @@ future<> read_records(file f, recordContainer *save_to, uint64_t start_from, uin
     });
 }
 
-
-//future<> read_records(file f, uint64_t start_from, uint64_t read_to) {
-//    if (read_to < start_from + RECORD_SIZE) {
-////        cerr << "impossibleshit\n";
-//        return make_ready_future();
-//    }
-//    // there should be nothing left, if it is we just discard it.
-//    return f.dma_read_exactly<char>(start_from, RECORD_SIZE).then([=](temporary_buffer<char> buf) mutable {
-//        // zrobiłem to kopiowanie, bo zarówno buf.prefix jak i buf.trim
-//        // jedyne co robią to _size = len, nie zmieniają bufora.
-//        temporary_buffer trimmed = temporary_buffer<char>(buf.get(), RECORD_SIZE);
-////        cerr << "wczytalem " << trimmed.get() << endl;
-//        INPUT_RECORDS.emplace_back(move(string(trimmed.get())));
-//        return read_records(f, start_from + RECORD_SIZE, read_to);
-//    });
-//}
-
 // pos - pozycja od której zaczynamy czytanie
 // po przeczytaniu znowu będziemy wołać read_chunk dla pos2 := pos + RAM_AVAILABLE,
 // zatem read_to w funkcji wyżej musi być pos + RAM_AVAILABLE (bo read() czyta do read_to - 1)
@@ -171,19 +154,21 @@ future<> read_specific_record_num(file f, uint64_t fsize, recordContainer *save_
  * @param num_records number of records to be read
  * @param starting_record record we start reading from
  */
-future<> read_chunk_file(uint64_t chunk, uint64_t num_records, uint64_t starting_record) {
+future<> read_chunk_file(uint64_t chunk, uint64_t num_records) {
     sstring fname = chunk_fname(chunk);
     return open_file_dma(fname, open_flags::rw).then([=](file f) mutable {
         return f.size().then([=](uint64_t fsize) mutable {
             CHUNKS[chunk].clear(); // TODO
-            return read_specific_record_num(f, fsize, &CHUNKS[chunk], num_records, starting_record);
+            return read_specific_record_num(f, fsize, &CHUNKS[chunk], num_records, TO_BE_TAKEN[chunk]).then([=](){
+                TO_BE_TAKEN[chunk] += CHUNKS[chunk].size();
+            });
         });
     });
 }
 
 
 future<stop_iteration> dump_output() {
-    cout << "nazbieralo sie " << OUTPUT_BATCH.size() << " elementow, dumpuje je.\n";
+    cout << "####### -> nazbieralo sie " << OUTPUT_BATCH.size() << " elementow, dumpuje je.\n";
     return make_ready_future<stop_iteration>(stop_iteration::no);
 }
 
@@ -200,23 +185,40 @@ future<stop_iteration> extract_min() {
             }
         }
     }
-    if (!sth_left)
+    if (!sth_left) {
+        cout << "1111\n";
         return make_ready_future<stop_iteration>(stop_iteration::yes);
+    }
+
     OUTPUT_BATCH.emplace_back(CHUNKS[min_idx].back());
     CHUNKS[min_idx].pop_back();
     if (CHUNKS[min_idx].empty()) {
         // need to load more data from disc
-        return read_chunk_file(min_idx, MERGING_BLOCK_SIZE, TO_BE_TAKEN[min_idx]).then([](){
+        cout << "2222\n";
+        return read_chunk_file(min_idx, MERGING_BLOCK_SIZE).then([](){
             if (OUTPUT_BATCH.size() == MERGING_BLOCK_SIZE) {
                 return dump_output();
             }
+            cout << "3333\n";
             return make_ready_future<stop_iteration>(stop_iteration::no);
         });
     }
     if (OUTPUT_BATCH.size() == MERGING_BLOCK_SIZE) {
+        cout << "4444\n";
         return dump_output();
     }
+    cout << "5555\n";
     return make_ready_future<stop_iteration>(stop_iteration::no);
+}
+
+future<> init_merge_phase(uint64_t chunks) {
+    vector<uint64_t> tmp{chunks};
+    uint64_t i = 0;
+    for (uint64_t &el : tmp)
+        el = i++;
+    return parallel_for_each(tmp.begin(), tmp.end(), [](uint64_t num_chunk){
+        return read_chunk_file(num_chunk, MERGING_BLOCK_SIZE);
+    });
 }
 
 /**
@@ -232,6 +234,7 @@ future<> merge_phase(uint64_t chunks) {
     uint64_t recs_per_chunk = RAM_FOR_CHUNKS / chunks;
     assert(recs_per_chunk > 0);
     CHUNKS = vector<recordContainer>{chunks};
+    TO_BE_TAKEN = vector<uint64_t>{chunks};
     OUTPUT_BATCH = recordContainer();
     return repeat(extract_min);
 //    return make_ready_future<vector<string>>(); TODO vector<string>
