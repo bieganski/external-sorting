@@ -15,8 +15,8 @@
 using namespace seastar;
 using namespace std;
 
-
-static const char *FNAME = "test.cpp";
+static const string FNAME = string("./lol");
+static const string TMP_DIR = string("./tmp/");
 
 
 // Dummy parameter-pack expander
@@ -38,17 +38,18 @@ call(Fun &&f, Args &&... args) {
 }
 
 
-//static const uint64_t RECORD_SIZE = 4096;
-static const size_t RECORD_SIZE = 4;
+static const uint64_t RECORD_SIZE = 4096;
+//static const size_t RECORD_SIZE = 4;
 //static const size_t RAM_AVAILABLE = RECORD_MAX_SIZE * 256 * 1024 * 4; // chunk size (4GB)
-static const size_t RAM_AVAILABLE = 8; // TODO nie to
-vector <string> records{}; // each of size RECORD_SIZE
+//static const size_t RAM_AVAILABLE = 8; // TODO nie to
+static const size_t RAM_AVAILABLE = RECORD_SIZE * 4; // TODO nie to
+static vector <string> records{}; // each of size RECORD_SIZE
 
 
 // możemy czytać bezpiecznie do `read_to - 1`
 future<> read_records(file f, uint64_t start_from, uint64_t read_to) {
     if (read_to < start_from + RECORD_SIZE) {
-        cerr << "impossibleshit\n";
+//        cerr << "impossibleshit\n";
         return make_ready_future();
     }
     // there should be nothing left, if it is we just discard it.
@@ -56,7 +57,7 @@ future<> read_records(file f, uint64_t start_from, uint64_t read_to) {
         // zrobiłem to kopiowanie, bo zarówno buf.prefix jak i buf.trim
         // jedyne co robią to _size = len, nie zmieniają bufora.
         temporary_buffer trimmed = temporary_buffer<char>(buf.get(), RECORD_SIZE);
-        cerr << "wczytalem " << trimmed.get() << endl;
+//        cerr << "wczytalem " << trimmed.get() << endl;
         records.emplace_back(move(string(trimmed.get())));
         return read_records(f, start_from + RECORD_SIZE, read_to);
     });
@@ -67,28 +68,31 @@ future<> read_records(file f, uint64_t start_from, uint64_t read_to) {
 // zatem read_to w funkcji wyżej musi być pos + RAM_AVAILABLE (bo read() czyta do read_to - 1)
 future<> read_chunk(file f, uint64_t pos, uint64_t fsize) {
     assert(records.empty());
-    uint read_to = pos + RAM_AVAILABLE;
-    if (read_to > fsize) {
-        return make_ready_future();
-    }
+    uint64_t read_to = read_to = min(pos + RAM_AVAILABLE, fsize);
+//    pos + RAM_AVAILABLE;
+//    if (read_to > fsize) {
+//        return make_ready_future();
+//    }
 //    return call(read_records, f, pos, read_to);
     return read_records(f, pos, read_to);
 }
 
 
-future<> dump_records(file f, uint64_t num_record = 0, uint64_t write_pos = 0) {
+future<> dump_records(file f, uint64_t num_record = 0) {
+    uint64_t write_pos = num_record * RECORD_SIZE;
+    cerr << records.size() << "\n";
     if (num_record > records.size() - 1)
         return make_ready_future();
-    return f.dma_write(write_pos, records[num_record].c_str(), RECORD_SIZE).then([=](size_t num) {
+    return f.dma_write<char>(write_pos, records[num_record].c_str(), RECORD_SIZE).then([=](size_t num) {
         assert(num == RECORD_SIZE);
-        return dump_records(f, num_record + 1, write_pos + RECORD_SIZE);
+        return dump_records(f, num_record + 1);
     });
 }
 
 
 future<> dump_sorted_chunk(uint64_t num_chunk) {
-    sstring fname = sstring(string("chunk") + to_string(num_chunk));
-    return open_file_dma(fname, open_flags::rw).then([](file f) {
+    sstring fname = sstring(TMP_DIR + string("chunk") + to_string(num_chunk));
+    return open_file_dma(fname, open_flags::rw | open_flags::create).then([](file f) {
         return dump_records(f);
     });
 }
@@ -96,13 +100,16 @@ future<> dump_sorted_chunk(uint64_t num_chunk) {
 future<> handle_chunks(file f, uint64_t fsize, uint64_t num_chunk = 0) {
     records.clear();
     uint64_t start_from = num_chunk * RAM_AVAILABLE;
-    if (start_from + RAM_AVAILABLE > fsize)
+//    if (start_from + RAM_AVAILABLE > fsize)
+//        return make_ready_future();
+    if (start_from >= fsize)
         return make_ready_future();
     return read_chunk(f, start_from, fsize).then([=](){
         sort(records.begin(), records.end());
-        dump_sorted_chunk(num_chunk);
-        cerr << "chunk nr " << num_chunk << ": zdumpowano " << records.size() << " rekordów.\n";
-        return handle_chunks(f, fsize, num_chunk + 1);
+        return dump_sorted_chunk(num_chunk).then([=] () {
+//            cerr << "chunk nr " << num_chunk << ": zdumpowano " << records.size() << " rekordów.\n";
+            return handle_chunks(f, fsize, num_chunk + 1);
+        });
     });
 }
 
