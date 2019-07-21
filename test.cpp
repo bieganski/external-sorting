@@ -11,6 +11,8 @@
 #include <iostream>
 #include <stdexcept>
 #include <algorithm>
+#include <deque>
+#include <vector>
 
 #include <boost/format.hpp>
 
@@ -39,7 +41,7 @@ call(Fun &&f, Args &&... args) {
     return std::forward<Fun>(f)(std::forward<Args>(args)...);
 }
 
-
+using recordVector = vector<string>;
 
 static const uint64_t RECORD_SIZE = 4096;
 //static const size_t RECORD_SIZE = 4;
@@ -49,22 +51,20 @@ static const size_t RAM_AVAILABLE = RECORD_SIZE * 24; // TODO nie to
 
 static const uint64_t MERGING_BLOCK_NUM_RECORDS = RAM_AVAILABLE / 10 / RECORD_SIZE; // number of records in merge-results chunks
 
-using recordContainer = vector <string>;
-
-static recordContainer INPUT_RECORDS{}; // used in splitting-into-chunks preproccessing phase for keeping records to be dumped
+static recordVector INPUT_RECORDS{}; // used in splitting-into-chunks preproccessing phase for keeping records to be dumped
 
 static vector<uint64_t > CHUNK_SIZES; // CHUNK_SIZES[i] contains number of records in ./tmp/chunk<i> file
 
-static vector<recordContainer> CHUNKS; // used in merging phase, CHUNKS[i] contains
+static vector<recordVector> CHUNKS; // used in merging phase, CHUNKS[i] contains
 
                                        // vector of some records from tmp/chunk<i> file
 
-static recordContainer OUTPUT_BATCH; // contains part of resulting file (it is to-be-concatenate)
+static recordVector OUTPUT_BATCH; // contains part of resulting file (it is to-be-concatenate)
 
 static vector<uint64_t> TO_BE_TAKEN; // number of record from CHUNKS[i] to be taken in next disc load
 
 // możemy czytać bezpiecznie do `read_to - 1`
-future<> read_records(file f, recordContainer *save_to, uint64_t start_from, uint64_t read_to) {
+future<> read_records(file f, recordVector *save_to, uint64_t start_from, uint64_t read_to) {
     if (read_to < start_from + RECORD_SIZE) {
         return make_ready_future();
     }
@@ -72,10 +72,11 @@ future<> read_records(file f, recordContainer *save_to, uint64_t start_from, uin
     return f.dma_read_exactly<char>(start_from, RECORD_SIZE).then([=](temporary_buffer<char> buf) {
         // zrobiłem to kopiowanie, bo zarówno buf.prefix jak i buf.trim
         // jedyne co robią to _size = len, nie zmieniają bufora.
-        temporary_buffer trimmed = temporary_buffer<char>(buf.get(), RECORD_SIZE);
+        string trimmed(buf.get(), RECORD_SIZE);
         assert(trimmed.size() == RECORD_SIZE);
+        assert(trimmed.length() == RECORD_SIZE);
 //        cerr << "wczytalem " << trimmed.get() << endl;
-        save_to->emplace_back(move(string(trimmed.get())));
+        save_to->emplace_back(move(trimmed));
         return read_records(f, save_to, start_from + RECORD_SIZE, read_to);
     });
 }
@@ -131,7 +132,7 @@ future<uint64_t> handle_chunks(file f, uint64_t fsize, uint64_t num_chunk = 0) {
     return read_chunk(f, start_from, fsize).then([=](){
         // sorting order is reversed, because it is easier to
         // handle merge sort in further steps
-        sort(INPUT_RECORDS.begin(), INPUT_RECORDS.end(), greater<string>());
+        sort(INPUT_RECORDS.begin(), INPUT_RECORDS.end());
         return dump_sorted_chunk(num_chunk).then([=] () {
 //            cerr << "chunk nr " << num_chunk << ": zdumpowano " << records.size() << " rekordów.\n";
             return handle_chunks(f, fsize, num_chunk + 1);
@@ -141,7 +142,7 @@ future<uint64_t> handle_chunks(file f, uint64_t fsize, uint64_t num_chunk = 0) {
 
 
 // może wczytać 0 lub więcej rekordów, maksymalnie `num_rec`
-future<> read_specific_record_num(file f, uint64_t fsize, recordContainer *save_to,
+future<> read_specific_record_num(file f, uint64_t fsize, recordVector *save_to,
         uint64_t num_rec, uint64_t start_reading_from_rec = 0) {
 
     uint64_t start_pos = start_reading_from_rec * RECORD_SIZE;
@@ -162,6 +163,7 @@ future<> read_chunk_file(uint64_t chunk, uint64_t num_records) {
         return f.size().then([=](uint64_t fsize) mutable {
             assert(CHUNKS[chunk].empty());
             return read_specific_record_num(f, fsize, &CHUNKS[chunk], num_records, TO_BE_TAKEN[chunk]).then([=](){
+                reverse(CHUNKS[chunk].begin(), CHUNKS[chunk].end());
                 TO_BE_TAKEN[chunk] += CHUNKS[chunk].size();
                 cout << "auuuu" << TO_BE_TAKEN << endl;
                 return make_ready_future<>();
@@ -173,18 +175,20 @@ future<> read_chunk_file(uint64_t chunk, uint64_t num_records) {
 
 future<stop_iteration> dump_output() {
     cout << "####### -> nazbieralo sie " << OUTPUT_BATCH.size() << " elementow, dumpuje je.\n";
+    OUTPUT_BATCH.clear();
     return make_ready_future<stop_iteration>(stop_iteration::no);
 }
 
 future<stop_iteration> extract_min(uint64_t records_per_chunk) {
-    uint64_t min_idx = -1;
+    int64_t min_idx = -1;
     bool sth_left = false;
     for (uint64_t i = 0; i < CHUNKS.size(); i++) {
         if (!CHUNKS[i].empty()) {
             sth_left = true;
             if (min_idx < 0) {
                 min_idx = i;
-            } else if (CHUNKS[i].back() < CHUNKS[min_idx].back()) {
+            }
+            else if (CHUNKS[i].back() < CHUNKS[min_idx].back()) {
                 min_idx = i;
             }
         }
@@ -194,14 +198,14 @@ future<stop_iteration> extract_min(uint64_t records_per_chunk) {
         return make_ready_future<stop_iteration>(stop_iteration::yes);
     }
 
-    OUTPUT_BATCH.emplace_back(CHUNKS[min_idx].back());
+    OUTPUT_BATCH.push_back(CHUNKS[min_idx].back());
     CHUNKS[min_idx].pop_back();
     if (CHUNKS[min_idx].empty()) {
-        // need to load more data from disc
-        cout << "2222\n" << flush;
-//        return make_ready_future<stop_iteration>(stop_iteration::yes);
+        // need to load more data from disk
+        cout << "2222\n";
         return read_chunk_file(min_idx, records_per_chunk).then([](){
             if (OUTPUT_BATCH.size() == MERGING_BLOCK_NUM_RECORDS) {
+                cout << "2137\n";
                 return dump_output();
             }
             cout << "3333\n";
@@ -238,17 +242,18 @@ future<> init_merge_phase(uint64_t chunks, uint64_t records_per_chunk) {
  */
 future<> merge_phase(uint64_t chunks) {
     uint64_t RAM_FOR_CHUNKS = RAM_AVAILABLE - MERGING_BLOCK_NUM_RECORDS * RECORD_SIZE;
-    uint64_t RECS_PER_CHUNK = RAM_FOR_CHUNKS / chunks;
+    uint64_t RECS_PER_CHUNK = RAM_FOR_CHUNKS / chunks / RECORD_SIZE;
     assert(RECS_PER_CHUNK > 0);
-    CHUNKS = vector<recordContainer>(chunks);
+    CHUNKS = vector<recordVector>(chunks);
     TO_BE_TAKEN = vector<uint64_t>(chunks);
-    OUTPUT_BATCH = recordContainer();
+    OUTPUT_BATCH = recordVector();
     return init_merge_phase(chunks, RECS_PER_CHUNK).then([=](){
-        for (auto el : CHUNKS) {
-            cout << el << endl;
-        }
-//        return repeat([=] () {return extract_min(RECS_PER_CHUNK);});
-        return make_ready_future<>();
+//        for (auto el : CHUNKS) {
+//            cout << el << endl;
+//        }
+        return repeat([=] () {return extract_min(RECS_PER_CHUNK);});
+//        return make_ready_future<>();
+
     });
 //    return make_ready_future<vector<string>>(); TODO vector<string>
 }
