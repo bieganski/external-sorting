@@ -98,15 +98,18 @@ future<> read_chunk(file f, uint64_t pos, uint64_t fsize) {
     return read_records(f, &INPUT_RECORDS, pos, read_to);
 }
 
-
-future<> dump_records(file f, recordVector * records, uint64_t num_record = 0) {
-    uint64_t write_pos = num_record * RECORD_SIZE;
+future<> dump_records_to_specific_pos(file f, recordVector * records, uint64_t starting_pos, uint64_t num_record = 0) {
+    uint64_t write_pos = starting_pos + num_record * RECORD_SIZE;
     if (num_record > records->size() - 1)
         return make_ready_future();
     return f.dma_write<char>(write_pos, (*records)[num_record].c_str(), RECORD_SIZE).then([=](size_t num) {
         assert(num == RECORD_SIZE);
-        return dump_records(f, records, num_record + 1);
+        return dump_records_to_specific_pos(f, records, starting_pos, num_record + 1);
     });
+}
+
+future<> dump_records(file f, recordVector * records) {
+    return dump_records_to_specific_pos(f, records, 0, 0);
 }
 
 
@@ -281,6 +284,35 @@ future<vector<string>> merge_phase(uint64_t chunks) {
 }
 
 
+// appends fname2 content to fname1
+// TODO
+// appendowanie po wielkości
+future<> merge2(string fname1, string fname2) {
+    return open_file_dma(fname1, open_flags::rw).then([=](file f1) {
+        return f1.size().then([=](uint64_t fsize1) mutable {
+            return open_file_dma(fname2, open_flags::rw).then([=](file f2) mutable {
+                return f2.size().then([=](uint64_t fsize2) mutable {
+                    assert(fsize1 % RECORD_SIZE == 0);
+                    assert(fsize2 % RECORD_SIZE == 0);
+                    return f1.allocate(fsize1, fsize2).then([=]() mutable {
+                        return read_specific_record_num(f2, fsize2, &INPUT_RECORDS, UINT64_MAX).then([=]() mutable {
+                            return dump_records_to_specific_pos(f1, &INPUT_RECORDS, fsize1);
+                        });
+                    });
+                });
+            });
+        });
+    });
+}
+
+
+
+future<> merge_output_files(vector<string> fnames) {
+    assert(fnames.size() > 1);
+    return merge2(fnames[0], fnames[1]);
+}
+
+
 future<> external_sort() {
     static sstring fname(FNAME);
     static uint64_t i = 0;
@@ -288,8 +320,8 @@ future<> external_sort() {
         return f.size().then([f](uint64_t fsize) mutable {
             return handle_chunks(f, fsize).then([](uint64_t chunks){
                 cerr << boost::format("stworzono %1% chunkow") % chunks;
-                return merge_phase(chunks).then([](vector<string>){
-                    return make_ready_future<>();
+                return merge_phase(chunks).then([](vector<string> fnames){
+                    return merge_output_files(fnames); // make_ready_future<>();
                 });
             });
         });
