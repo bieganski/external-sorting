@@ -21,6 +21,7 @@ using namespace std;
 
 static const string FNAME = string("./lol");
 static const string TMP_DIR = string("./tmp/");
+static const string OUT_DIR = string("./out/");
 
 
 // Dummy parameter-pack expander
@@ -63,6 +64,8 @@ static recordVector OUTPUT_BATCH; // contains part of resulting file (it is to-b
 
 static vector<uint64_t> TO_BE_TAKEN; // number of record from CHUNKS[i] to be taken in next disc load
 
+static vector<string> OUT_FNAMES; // output (to-be-merged) filenames
+
 // możemy czytać bezpiecznie do `read_to - 1`
 future<> read_records(file f, recordVector *save_to, uint64_t start_from, uint64_t read_to) {
     if (read_to < start_from + RECORD_SIZE) {
@@ -96,27 +99,27 @@ future<> read_chunk(file f, uint64_t pos, uint64_t fsize) {
 }
 
 
-future<> dump_records(file f, uint64_t num_record = 0) {
+future<> dump_records(file f, recordVector * records, uint64_t num_record = 0) {
     uint64_t write_pos = num_record * RECORD_SIZE;
-    if (num_record > INPUT_RECORDS.size() - 1)
+    if (num_record > records->size() - 1)
         return make_ready_future();
-    return f.dma_write<char>(write_pos, INPUT_RECORDS[num_record].c_str(), RECORD_SIZE).then([=](size_t num) {
+    return f.dma_write<char>(write_pos, (*records)[num_record].c_str(), RECORD_SIZE).then([=](size_t num) {
         assert(num == RECORD_SIZE);
-        return dump_records(f, num_record + 1);
+        return dump_records(f, records, num_record + 1);
     });
 }
 
 
-inline sstring chunk_fname(uint64_t num_chunk) {
+inline sstring tmp_chunk_name(uint64_t num_chunk) {
     return sstring(TMP_DIR + string("chunk") + to_string(num_chunk));
 }
 
 future<> dump_sorted_chunk(uint64_t num_chunk) {
-    sstring fname = chunk_fname(num_chunk);
+    sstring fname = tmp_chunk_name(num_chunk);
 //    cerr << records.size() << "\n";
     return open_file_dma(fname, open_flags::rw | open_flags::create).then([](file f) {
         CHUNK_SIZES.emplace_back(INPUT_RECORDS.size());
-        return dump_records(f);
+        return dump_records(f, &INPUT_RECORDS);
     });
 }
 
@@ -158,7 +161,7 @@ future<> read_specific_record_num(file f, uint64_t fsize, recordVector *save_to,
 future<> read_chunk_file(uint64_t chunk, uint64_t num_records) {
     cerr << "#########zostalem zawolany dla chunk = " << chunk << ", num_rec=" << num_records << endl;
     cout << TO_BE_TAKEN << endl;
-    sstring fname = chunk_fname(chunk);
+    sstring fname = tmp_chunk_name(chunk);
     return open_file_dma(fname, open_flags::rw).then([=](file f) mutable {
         return f.size().then([=](uint64_t fsize) mutable {
             assert(CHUNKS[chunk].empty());
@@ -173,10 +176,23 @@ future<> read_chunk_file(uint64_t chunk, uint64_t num_records) {
 }
 
 
+inline sstring out_chunk_name(uint64_t num_chunk) {
+    return sstring(OUT_DIR + string("chunk") + to_string(num_chunk));
+}
+
+
 future<stop_iteration> dump_output() {
+    static uint64_t chunk_num = 0;
+    sstring fname = out_chunk_name(chunk_num);
     cout << "####### -> nazbieralo sie " << OUTPUT_BATCH.size() << " elementow, dumpuje je.\n";
-    OUTPUT_BATCH.clear();
-    return make_ready_future<stop_iteration>(stop_iteration::no);
+    OUT_FNAMES.push_back(fname);
+    return open_file_dma(fname, open_flags::rw | open_flags::create).then([](file f) {
+        return dump_records(f, &OUTPUT_BATCH).then([](){
+            OUTPUT_BATCH.clear();
+            chunk_num++;
+            return make_ready_future<stop_iteration>(stop_iteration::no);
+        });
+    });
 }
 
 future<stop_iteration> extract_min(uint64_t records_per_chunk) {
@@ -240,22 +256,25 @@ future<> init_merge_phase(uint64_t chunks, uint64_t records_per_chunk) {
  * @param chunks ilośc stworzonych plików chunksN
  * @return wektor nazw plików, które należy skonkatenować, by otrzymać posortowany plik wejściowy.
  */
-future<> merge_phase(uint64_t chunks) {
+future<vector<string>> merge_phase(uint64_t chunks) {
     uint64_t RAM_FOR_CHUNKS = RAM_AVAILABLE - MERGING_BLOCK_NUM_RECORDS * RECORD_SIZE;
     uint64_t RECS_PER_CHUNK = RAM_FOR_CHUNKS / chunks / RECORD_SIZE;
     assert(RECS_PER_CHUNK > 0);
     CHUNKS = vector<recordVector>(chunks);
     TO_BE_TAKEN = vector<uint64_t>(chunks);
     OUTPUT_BATCH = recordVector();
+    OUT_FNAMES = vector<string>();
     return init_merge_phase(chunks, RECS_PER_CHUNK).then([=](){
 //        for (auto el : CHUNKS) {
 //            cout << el << endl;
 //        }
-        return repeat([=] () {return extract_min(RECS_PER_CHUNK);});
+        return repeat([=] () {return extract_min(RECS_PER_CHUNK);}).then([](){
+            return make_ready_future<vector<string>>(OUT_FNAMES);
+        });
 //        return make_ready_future<>();
 
     });
-//    return make_ready_future<vector<string>>(); TODO vector<string>
+//     TODO vector<string>
 }
 
 
@@ -266,7 +285,9 @@ future<> external_sort() {
         return f.size().then([f](uint64_t fsize) mutable {
             return handle_chunks(f, fsize).then([](uint64_t chunks){
                 cerr << boost::format("stworzono %1% chunkow") % chunks;
-                return merge_phase(chunks);
+                return merge_phase(chunks).then([](vector<string>){
+                    return make_ready_future<>();
+                });
             });
         });
     });
