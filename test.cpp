@@ -48,6 +48,8 @@ static std::vector<uint64_t> TO_BE_TAKEN; // number of record from CHUNKS[i] to 
 
 static std::vector<string> OUT_FNAMES; // output (to-be-merged) filenames
 
+static std::vector<recordVector> OUT_MERGE_BUFFER; // here are put records from to-be-merged output files
+
 // możemy czytać bezpiecznie do `read_to - 1`
 future<> read_records(file f, recordVector *save_to, uint64_t start_from, uint64_t read_to) {
     if (read_to < start_from + RECORD_SIZE) {
@@ -266,15 +268,21 @@ future<vector<string>> merge_phase(uint64_t chunks) {
 }
 
 
-void prepareContainers(vector<string> filenames) {
-
+void prepareContainers(uint64_t num_workers) {
+    for (auto el : OUT_MERGE_BUFFER) {
+        el.clear();
+    }
+    OUT_MERGE_BUFFER.clear();
+    for (uint64_t i = 0; i < num_workers; i++) {
+        OUT_MERGE_BUFFER.emplace_back(recordVector());
+    }
 }
 
 // appends fname2 content to fname1
 // TODO
 // appendowanie po wielkości
-future<> merge2(string fname1, string fname2) {
-    return open_file_dma(fname1, open_flags::rw).then([=](file f1) {
+future<> merge2(string fname1, string fname2, uint64_t my_num_worker) {
+    return open_file_dma(fname1, open_flags::rw).then([=](file f1) mutable {
         return f1.size().then([=](uint64_t fsize1) mutable {
             return open_file_dma(fname2, open_flags::rw).then([=](file f2) mutable {
                 return f2.size().then([=](uint64_t fsize2) mutable {
@@ -284,8 +292,8 @@ future<> merge2(string fname1, string fname2) {
 //                    return f1.allocate(fsize1, fsize2).then([=]() mutable {
 //
 //                    });
-                    return read_specific_record_num(f2, fsize2, &INPUT_RECORDS, UINT64_MAX).then([=]() mutable {
-                        return dump_records_to_specific_pos(f1, &INPUT_RECORDS, fsize1);
+                    return read_specific_record_num(f2, fsize2, &OUT_MERGE_BUFFER[my_num_worker], UINT64_MAX).then([=]() mutable {
+                        return dump_records_to_specific_pos(f1, &OUT_MERGE_BUFFER[my_num_worker], fsize1);
                     });
                 });
             });
@@ -309,9 +317,10 @@ future<> do_merging(vector<string> fnames) {
         if (i % 2 == 0 && i != out_files_num - 1)
             first_indices.push_back(i);
     }
+    prepareContainers(first_indices.size());
     cout << "2first_indices: " << first_indices << endl;
     return parallel_for_each(first_indices.begin(), first_indices.end(), [=](uint64_t num_first){
-        return merge2(fnames[num_first], fnames[num_first + 1]);
+        return merge2(fnames[num_first], fnames[num_first + 1], num_first / 2);
     });
 }
 
@@ -329,7 +338,7 @@ future<> merge_output_files(vector<string> fnames) {
             }
             i++;
         }
-        return make_ready_future<>(); // merge_output_files(trimmed_fnames);
+        return merge_output_files(trimmed_fnames);
     });
 }
 
@@ -364,6 +373,8 @@ int compute(int argc, char **argv) {
  * TODO:
  * assert fsize % RECORD_SIZE == 0
  * read_specific_record_num powinno zwracać ile przeczytało
+ * cleanup
+ * WAZNE: nie wczytywac calych plikow do pamieci w mergowaniu
  */
 int main(int argc, char **argv) {
     static_assert(RAM_AVAILABLE % RECORD_SIZE == 0,
