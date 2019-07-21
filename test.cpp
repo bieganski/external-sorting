@@ -1,25 +1,47 @@
-#include <seastar/core/sleep.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/file.hh>
 #include "seastar/core/reactor.hh"
 #include "seastar/core/sstring.hh"
-// #include "seastar/core/aligned_buffer.hh"
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/future-util.hh>
 
 #include <iostream>
-#include <stdexcept>
 #include <algorithm>
-#include <deque>
 #include <vector>
 
-#include <boost/format.hpp>
+
+
+/*!
+ *  \author    Mateusz Biegański
+ *
+ *  OPIS ROZWIĄZANIA:
+ *
+ *  Moja implementacja sortowania składa się z trzech faz:
+ *  * wczytywanie i sortowanie mniejszych kawałków (PREPROCESSING)
+ *  * sortowanie mniejszych bloków i zapisywanie ich do pomniejszych plików (MERGE)
+ *  * scalanie wynikowych plików w jeden (OUTPUT MERGING)
+ *
+ *  Wejściowy plik wczytywany i sortowany jest w kawałkach na tyle dużych, żeby zmaksymalizować
+ *  zużycie pamięci, nie przekraczając jednak wartości `RAM_AVAILABLE`. W następnej fazie pliki
+ *  są ładowane z dysku, a następnie zapisywane w ostatecznej kolejności, uprzednio sortowane przez scalanie
+ *  (k-way mergesort). W ostatniej fazie następuje scalanie posortowanych bloków w plkik wynikowy
+ *  (wielowątkowe scalanie parami w czasie N*logN)
+ *
+ *
+ *  ZAŁOŻENIA:
+ *  * rekordy w pliku wejściowym nie są oddzielone żadnym znakiem, tj
+ *  plik zawierający dwa rekordy ma dokładnie 8192 znaki.
+ *  * plik wejściowy jest dobrze uformowany, tj. zawiera pełne rekordy.
+ */
 
 using namespace seastar;
 using namespace std;
 
-static const string FNAME = string("./lol");
+
+static const string FNAME = string("./input.txt"); // TODO tu należy wpisać nazwę pliku wejściowego
+
+
 static const string TMP_DIR = string("./tmp/");
 static const string OUT_DIR = string("./out/");
 
@@ -27,12 +49,12 @@ static const string OUT_DIR = string("./out/");
 using recordVector = std::vector<string>;
 
 static const uint64_t RECORD_SIZE = 4096;
-//static const size_t RECORD_SIZE = 4;
+
 static const size_t RAM_AVAILABLE = RECORD_SIZE * 256 * 1024 * 4; // preprocessing chunk size (4GB)
-//static const size_t RAM_AVAILABLE = 8; // TODO nie to
-//static const size_t RAM_AVAILABLE = RECORD_SIZE * 24; // TODO nie to
 
 static const uint64_t MERGING_BLOCK_NUM_RECORDS = RAM_AVAILABLE / RECORD_SIZE / 10; // number of records in merge-results chunks
+
+
 
 static recordVector INPUT_RECORDS{}; // used in splitting-into-chunks preproccessing phase for keeping records to be dumped
 
@@ -52,19 +74,20 @@ static std::vector<recordVector> OUT_MERGE_BUFFER; // here are put records from 
 
 static uint64_t MAX_RECORDS_PER_WORKER = 0; // during output merging, how many records may I buffer
 
+
+
+
 // możemy czytać bezpiecznie do `read_to - 1`
 future<> read_records(file f, recordVector *save_to, uint64_t start_from, uint64_t read_to) {
     if (read_to < start_from + RECORD_SIZE) {
         return make_ready_future();
     }
-    // there should be nothing left, if it is we just discard it.
     return f.dma_read_exactly<char>(start_from, RECORD_SIZE).then([=](temporary_buffer<char> buf) {
         // zrobiłem to kopiowanie, bo zarówno buf.prefix jak i buf.trim
         // jedyne co robią to _size = len, nie zmieniają bufora.
         string trimmed(buf.get(), RECORD_SIZE);
         assert(trimmed.size() == RECORD_SIZE);
         assert(trimmed.length() == RECORD_SIZE);
-//        cerr << "wczytalem " << trimmed.get() << endl;
         save_to->emplace_back(move(trimmed));
         return read_records(f, save_to, start_from + RECORD_SIZE, read_to);
     });
@@ -76,11 +99,6 @@ future<> read_records(file f, recordVector *save_to, uint64_t start_from, uint64
 future<> read_chunk(file f, uint64_t pos, uint64_t fsize) {
     assert(INPUT_RECORDS.empty());
     uint64_t read_to = min(pos + RAM_AVAILABLE, fsize);
-//    pos + RAM_AVAILABLE;
-//    if (read_to > fsize) {
-//        return make_ready_future();
-//    }
-//    return call(read_records, f, pos, read_to);
     return read_records(f, &INPUT_RECORDS, pos, read_to);
 }
 
@@ -105,7 +123,6 @@ inline sstring tmp_chunk_name(uint64_t num_chunk) {
 
 future<> dump_sorted_chunk(uint64_t num_chunk) {
     sstring fname = tmp_chunk_name(num_chunk);
-//    cerr << records.size() << "\n";
     return open_file_dma(fname, open_flags::rw | open_flags::create).then([](file f) {
         CHUNK_SIZES.emplace_back(INPUT_RECORDS.size());
         return dump_records(f, &INPUT_RECORDS);
@@ -117,16 +134,11 @@ future<> dump_sorted_chunk(uint64_t num_chunk) {
 future<uint64_t> handle_chunks(file f, uint64_t fsize, uint64_t num_chunk = 0) {
     INPUT_RECORDS.clear();
     uint64_t start_from = num_chunk * RAM_AVAILABLE;
-//    if (start_from + RAM_AVAILABLE > fsize)
-//        return make_ready_future();
     if (start_from >= fsize)
         return make_ready_future<uint64_t>(num_chunk);
     return read_chunk(f, start_from, fsize).then([=](){
-        // sorting order is reversed, because it is easier to
-        // handle merge sort in further steps
         sort(INPUT_RECORDS.begin(), INPUT_RECORDS.end());
         return dump_sorted_chunk(num_chunk).then([=] () {
-//            cerr << "chunk nr " << num_chunk << ": zdumpowano " << records.size() << " rekordów.\n";
             return handle_chunks(f, fsize, num_chunk + 1);
         });
     });
@@ -148,8 +160,6 @@ future<> read_specific_record_num(file f, uint64_t fsize, recordVector *save_to,
  * @param starting_record record we start reading from
  */
 future<> read_chunk_file(uint64_t chunk, uint64_t num_records) {
-    cerr << "#########zostalem zawolany dla chunk = " << chunk << ", num_rec=" << num_records << endl;
-    cout << TO_BE_TAKEN << endl;
     sstring fname = tmp_chunk_name(chunk);
     return open_file_dma(fname, open_flags::rw).then([=](file f) mutable {
         return f.size().then([=](uint64_t fsize) mutable {
@@ -157,7 +167,6 @@ future<> read_chunk_file(uint64_t chunk, uint64_t num_records) {
             return read_specific_record_num(f, fsize, &CHUNKS[chunk], num_records, TO_BE_TAKEN[chunk]).then([=](){
                 reverse(CHUNKS[chunk].begin(), CHUNKS[chunk].end());
                 TO_BE_TAKEN[chunk] += CHUNKS[chunk].size();
-                cout << "auuuu" << TO_BE_TAKEN << endl;
                 return make_ready_future<>();
             });
         });
@@ -173,7 +182,6 @@ inline sstring out_chunk_name(uint64_t num_chunk) {
 future<stop_iteration> dump_output() {
     static uint64_t chunk_num = 0;
     sstring fname = out_chunk_name(chunk_num);
-    cout << "####### -> nazbieralo sie " << OUTPUT_BATCH.size() << " elementow, dumpuje je.\n";
     OUT_FNAMES.push_back(fname);
     return open_file_dma(fname, open_flags::rw | open_flags::create).then([](file f) {
         return dump_records(f, &OUTPUT_BATCH).then([](){
@@ -199,7 +207,6 @@ future<stop_iteration> extract_min(uint64_t records_per_chunk) {
         }
     }
     if (!sth_left) {
-        cout << "1111\n";
         if (!OUTPUT_BATCH.empty()) {
             return dump_output();
         }
@@ -210,21 +217,16 @@ future<stop_iteration> extract_min(uint64_t records_per_chunk) {
     CHUNKS[min_idx].pop_back();
     if (CHUNKS[min_idx].empty()) {
         // need to load more data from disk
-        cout << "2222\n";
         return read_chunk_file(min_idx, records_per_chunk).then([](){
             if (OUTPUT_BATCH.size() == MERGING_BLOCK_NUM_RECORDS) {
-                cout << "2137\n";
                 return dump_output();
             }
-            cout << "3333\n";
             return make_ready_future<stop_iteration>(stop_iteration::no);
         });
     }
     if (OUTPUT_BATCH.size() == MERGING_BLOCK_NUM_RECORDS) {
-        cout << "4444\n";
         return dump_output();
     }
-    cout << "5555\n";
     return make_ready_future<stop_iteration>(stop_iteration::no);
 }
 
@@ -257,16 +259,10 @@ future<vector<string>> merge_phase(uint64_t chunks) {
     OUTPUT_BATCH = recordVector();
     OUT_FNAMES = vector<string>();
     return init_merge_phase(chunks, RECS_PER_CHUNK).then([=](){
-//        for (auto el : CHUNKS) {
-//            cout << el << endl;
-//        }
         return repeat([=] () {return extract_min(RECS_PER_CHUNK);}).then([](){
             return make_ready_future<vector<string>>(OUT_FNAMES);
         });
-//        return make_ready_future<>();
-
     });
-//     TODO vector<string>
 }
 
 
@@ -300,9 +296,9 @@ future<> read_and_dump_output_batch(file f1, uint64_t fsize1, file f2, uint64_t 
                 });
             });
 }
+
+
 // appends fname2 content to fname1
-// TODO
-// appendowanie po wielkości
 future<> merge2(string fname1, string fname2, uint64_t my_num_worker) {
     return open_file_dma(fname1, open_flags::rw).then([=](file f1) mutable {
         return f1.size().then([=](uint64_t fsize1) mutable {
@@ -310,16 +306,9 @@ future<> merge2(string fname1, string fname2, uint64_t my_num_worker) {
                 return f2.size().then([=](uint64_t fsize2) mutable {
                     assert(fsize1 % RECORD_SIZE == 0);
                     assert(fsize2 % RECORD_SIZE == 0);
-//                    cout << "mam dostep do plikow" << fname1 <<", " << fname2 << endl;
                     return read_and_dump_output_batch(f1, fsize1, f2, fsize2, my_num_worker).then([=](){
                         return remove_file(fname2);
                     });
-//                    return f1.allocate(fsize1, fsize2).then([=]() mutable {
-//
-//                    });
-//                    return read_specific_record_num(f2, fsize2, &OUT_MERGE_BUFFER[my_num_worker], UINT64_MAX).then([=]() mutable {
-//                        return dump_records_to_specific_pos(f1, &OUT_MERGE_BUFFER[my_num_worker], fsize1);
-//                    });
                 });
             });
         });
@@ -328,11 +317,9 @@ future<> merge2(string fname1, string fname2, uint64_t my_num_worker) {
 
 
 
-/**
- * Mergowanie wynikowych plików odbywa się równolegle, dla N plików pracuje N / 2 wątków.
- */
+// Mergowanie wynikowych plików odbywa się równolegle, w każdej fazie
+// dla N plików pracuje N / 2 wątków. (liczba plików zmniejsza się z czasem)
 future<> do_merging(vector<string> fnames) {
-    cout << "1fnames:" << fnames << endl;
     vector<uint64_t> first_indices;
     size_t out_files_num = fnames.size();
     assert (out_files_num > 1);
@@ -342,7 +329,6 @@ future<> do_merging(vector<string> fnames) {
             first_indices.push_back(i);
     }
     prepareMergePhase(first_indices.size());
-    cout << "2first_indices: " << first_indices << endl;
     return parallel_for_each(first_indices.begin(), first_indices.end(), [=](uint64_t num_first){
         return merge2(fnames[num_first], fnames[num_first + 1], num_first / 2);
     });
@@ -366,20 +352,21 @@ future<> merge_output_files(vector<string> fnames) {
     });
 }
 
+
 future<> external_sort() {
     static sstring fname(FNAME);
     static uint64_t i = 0;
     return open_file_dma(fname, open_flags::rw).then([](file f) {
         return f.size().then([f](uint64_t fsize) mutable {
             return handle_chunks(f, fsize).then([](uint64_t chunks){
-                cerr << boost::format("stworzono %1% chunkow") % chunks;
                 return merge_phase(chunks).then([](vector<string> fnames){
-                    return merge_output_files(fnames); // make_ready_future<>();
+                    return merge_output_files(fnames);
                 });
             });
         });
     });
 }
+
 
 int compute(int argc, char **argv) {
     app_template app;
@@ -395,11 +382,7 @@ int compute(int argc, char **argv) {
 
 /**
  * TODO:
- * assert fsize % RECORD_SIZE == 0
- * read_specific_record_num powinno zwracać ile przeczytało
- * cleanup
- * usuwac pliki juz zmergowane
- * WAZNE: nie wczytywac calych plikow do pamieci w mergowaniu
+ * assert fsize % RECORD_SIZE == 0, gdzie fsize jest wejściowym plikiem
  */
 int main(int argc, char **argv) {
     static_assert(RAM_AVAILABLE % RECORD_SIZE == 0,
@@ -407,5 +390,7 @@ int main(int argc, char **argv) {
     static_assert(MERGING_BLOCK_NUM_RECORDS * RECORD_SIZE < RAM_AVAILABLE / 2,
             "Dokup RAMu albo zmniejsz MERGING_BLOCK_NUM_RECORDS!");
     compute(argc, argv);
+    cout << "Posortowany plik znajduje się w katalogu " << OUT_DIR << " pod nazwą chunk0" << endl;
+    return 0;
 }
 
