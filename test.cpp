@@ -30,9 +30,9 @@ static const uint64_t RECORD_SIZE = 4096;
 //static const size_t RECORD_SIZE = 4;
 //static const size_t RAM_AVAILABLE = RECORD_MAX_SIZE * 256 * 1024 * 4; // preprocessing chunk size (4GB)
 //static const size_t RAM_AVAILABLE = 8; // TODO nie to
-static const size_t RAM_AVAILABLE = RECORD_SIZE * 60; // TODO nie to
+static const size_t RAM_AVAILABLE = RECORD_SIZE * 10; // TODO nie to
 
-static const uint64_t MERGING_BLOCK_NUM_RECORDS = RAM_AVAILABLE / 10 / RECORD_SIZE; // number of records in merge-results chunks
+static const uint64_t MERGING_BLOCK_NUM_RECORDS = RAM_AVAILABLE / RECORD_SIZE / 10; // number of records in merge-results chunks
 
 static recordVector INPUT_RECORDS{}; // used in splitting-into-chunks preproccessing phase for keeping records to be dumped
 
@@ -49,6 +49,8 @@ static std::vector<uint64_t> TO_BE_TAKEN; // number of record from CHUNKS[i] to 
 static std::vector<string> OUT_FNAMES; // output (to-be-merged) filenames
 
 static std::vector<recordVector> OUT_MERGE_BUFFER; // here are put records from to-be-merged output files
+
+static uint64_t MAX_RECORDS_PER_WORKER = 0; // during output merging, how many records may I buffer
 
 // możemy czytać bezpiecznie do `read_to - 1`
 future<> read_records(file f, recordVector *save_to, uint64_t start_from, uint64_t read_to) {
@@ -268,7 +270,9 @@ future<vector<string>> merge_phase(uint64_t chunks) {
 }
 
 
-void prepareContainers(uint64_t num_workers) {
+void prepareMergePhase(uint64_t num_workers) {
+    MAX_RECORDS_PER_WORKER = RAM_AVAILABLE / RECORD_SIZE / num_workers;
+    assert(MAX_RECORDS_PER_WORKER > 0 && "Cannot perform multithread merging! Not enough RAM amount");
     for (auto el : OUT_MERGE_BUFFER) {
         el.clear();
     }
@@ -276,8 +280,23 @@ void prepareContainers(uint64_t num_workers) {
     for (uint64_t i = 0; i < num_workers; i++) {
         OUT_MERGE_BUFFER.emplace_back(recordVector());
     }
+    TO_BE_TAKEN.clear();
+    for (uint64_t i = 0; i < num_workers; i++) {
+        TO_BE_TAKEN.emplace_back(0);
+    }
 }
 
+
+future<> read_and_dump_output_batch(file f1, uint64_t fsize1, file f2, uint64_t fsize2, uint64_t my_num_worker) {
+    return read_specific_record_num(f2, fsize2, &OUT_MERGE_BUFFER[my_num_worker],
+            MAX_RECORDS_PER_WORKER, TO_BE_TAKEN[my_num_worker]).then([=]() {
+//                uint64_t write_to = fsize1 + TO_BE_TAKEN[my_num_worker] * RECORD_SIZE;
+                TO_BE_TAKEN[my_num_worker] += OUT_MERGE_BUFFER[my_num_worker].size();
+                return dump_records_to_specific_pos(f1, &OUT_MERGE_BUFFER[my_num_worker], fsize1).then([](){
+                    OUT_MERGE_BUFFER.clear();
+                });
+            });
+}
 // appends fname2 content to fname1
 // TODO
 // appendowanie po wielkości
@@ -288,13 +307,14 @@ future<> merge2(string fname1, string fname2, uint64_t my_num_worker) {
                 return f2.size().then([=](uint64_t fsize2) mutable {
                     assert(fsize1 % RECORD_SIZE == 0);
                     assert(fsize2 % RECORD_SIZE == 0);
-                    cout << "mam dostep do plikow" << fname1 <<", " << fname2 << endl;
+//                    cout << "mam dostep do plikow" << fname1 <<", " << fname2 << endl;
+                    return read_and_dump_output_batch(f1, fsize1, f2, fsize2, my_num_worker);
 //                    return f1.allocate(fsize1, fsize2).then([=]() mutable {
 //
 //                    });
-                    return read_specific_record_num(f2, fsize2, &OUT_MERGE_BUFFER[my_num_worker], UINT64_MAX).then([=]() mutable {
-                        return dump_records_to_specific_pos(f1, &OUT_MERGE_BUFFER[my_num_worker], fsize1);
-                    });
+//                    return read_specific_record_num(f2, fsize2, &OUT_MERGE_BUFFER[my_num_worker], UINT64_MAX).then([=]() mutable {
+//                        return dump_records_to_specific_pos(f1, &OUT_MERGE_BUFFER[my_num_worker], fsize1);
+//                    });
                 });
             });
         });
@@ -305,7 +325,6 @@ future<> merge2(string fname1, string fname2, uint64_t my_num_worker) {
 
 /**
  * Mergowanie wynikowych plików odbywa się równolegle, dla N plików pracuje N / 2 wątków.
- *
  */
 future<> do_merging(vector<string> fnames) {
     cout << "1fnames:" << fnames << endl;
@@ -317,7 +336,7 @@ future<> do_merging(vector<string> fnames) {
         if (i % 2 == 0 && i != out_files_num - 1)
             first_indices.push_back(i);
     }
-    prepareContainers(first_indices.size());
+    prepareMergePhase(first_indices.size());
     cout << "2first_indices: " << first_indices << endl;
     return parallel_for_each(first_indices.begin(), first_indices.end(), [=](uint64_t num_first){
         return merge2(fnames[num_first], fnames[num_first + 1], num_first / 2);
@@ -374,6 +393,7 @@ int compute(int argc, char **argv) {
  * assert fsize % RECORD_SIZE == 0
  * read_specific_record_num powinno zwracać ile przeczytało
  * cleanup
+ * usuwac pliki juz zmergowane
  * WAZNE: nie wczytywac calych plikow do pamieci w mergowaniu
  */
 int main(int argc, char **argv) {
