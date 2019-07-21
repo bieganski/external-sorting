@@ -24,25 +24,7 @@ static const string TMP_DIR = string("./tmp/");
 static const string OUT_DIR = string("./out/");
 
 
-// Dummy parameter-pack expander
-template<class T>
-void expand(std::initializer_list<T>) {}
-
-// Fun
-template<class Fun, class... Args>
-typename std::result_of<Fun &&(Args &&...)>::type
-call(Fun &&f, Args &&... args) {
-
-    // Print all parameters
-    std::cout << "Params : ";
-    expand({(std::cout << args << ' ', 0)...});
-    std::cout << '\n';
-
-    // Forward the call
-    return std::forward<Fun>(f)(std::forward<Args>(args)...);
-}
-
-using recordVector = vector<string>;
+using recordVector = std::vector<string>;
 
 static const uint64_t RECORD_SIZE = 4096;
 //static const size_t RECORD_SIZE = 4;
@@ -54,17 +36,17 @@ static const uint64_t MERGING_BLOCK_NUM_RECORDS = RAM_AVAILABLE / 10 / RECORD_SI
 
 static recordVector INPUT_RECORDS{}; // used in splitting-into-chunks preproccessing phase for keeping records to be dumped
 
-static vector<uint64_t > CHUNK_SIZES; // CHUNK_SIZES[i] contains number of records in ./tmp/chunk<i> file
+static std::vector<uint64_t > CHUNK_SIZES; // CHUNK_SIZES[i] contains number of records in ./tmp/chunk<i> file
 
-static vector<recordVector> CHUNKS; // used in merging phase, CHUNKS[i] contains
+static std::vector<recordVector> CHUNKS; // used in merging phase, CHUNKS[i] contains
 
                                        // vector of some records from tmp/chunk<i> file
 
 static recordVector OUTPUT_BATCH; // contains part of resulting file (it is to-be-concatenate)
 
-static vector<uint64_t> TO_BE_TAKEN; // number of record from CHUNKS[i] to be taken in next disc load
+static std::vector<uint64_t> TO_BE_TAKEN; // number of record from CHUNKS[i] to be taken in next disc load
 
-static vector<string> OUT_FNAMES; // output (to-be-merged) filenames
+static std::vector<string> OUT_FNAMES; // output (to-be-merged) filenames
 
 // możemy czytać bezpiecznie do `read_to - 1`
 future<> read_records(file f, recordVector *save_to, uint64_t start_from, uint64_t read_to) {
@@ -284,6 +266,10 @@ future<vector<string>> merge_phase(uint64_t chunks) {
 }
 
 
+void prepareContainers(vector<string> filenames) {
+
+}
+
 // appends fname2 content to fname1
 // TODO
 // appendowanie po wielkości
@@ -294,10 +280,12 @@ future<> merge2(string fname1, string fname2) {
                 return f2.size().then([=](uint64_t fsize2) mutable {
                     assert(fsize1 % RECORD_SIZE == 0);
                     assert(fsize2 % RECORD_SIZE == 0);
-                    return f1.allocate(fsize1, fsize2).then([=]() mutable {
-                        return read_specific_record_num(f2, fsize2, &INPUT_RECORDS, UINT64_MAX).then([=]() mutable {
-                            return dump_records_to_specific_pos(f1, &INPUT_RECORDS, fsize1);
-                        });
+                    cout << "mam dostep do plikow" << fname1 <<", " << fname2 << endl;
+//                    return f1.allocate(fsize1, fsize2).then([=]() mutable {
+//
+//                    });
+                    return read_specific_record_num(f2, fsize2, &INPUT_RECORDS, UINT64_MAX).then([=]() mutable {
+                        return dump_records_to_specific_pos(f1, &INPUT_RECORDS, fsize1);
                     });
                 });
             });
@@ -307,11 +295,43 @@ future<> merge2(string fname1, string fname2) {
 
 
 
-future<> merge_output_files(vector<string> fnames) {
-    assert(fnames.size() > 1);
-    return merge2(fnames[0], fnames[1]);
+/**
+ * Mergowanie wynikowych plików odbywa się równolegle, dla N plików pracuje N / 2 wątków.
+ *
+ */
+future<> do_merging(vector<string> fnames) {
+    cout << "1fnames:" << fnames << endl;
+    vector<uint64_t> first_indices;
+    size_t out_files_num = fnames.size();
+    assert (out_files_num > 1);
+
+    for (uint64_t i = 0; i < out_files_num; i++) {
+        if (i % 2 == 0 && i != out_files_num - 1)
+            first_indices.push_back(i);
+    }
+    cout << "2first_indices: " << first_indices << endl;
+    return parallel_for_each(first_indices.begin(), first_indices.end(), [=](uint64_t num_first){
+        return merge2(fnames[num_first], fnames[num_first + 1]);
+    });
 }
 
+
+future<> merge_output_files(vector<string> fnames) {
+    if (fnames.size() == 1) {
+        return make_ready_future<>();
+    }
+    return do_merging(fnames).then([=](){
+        vector<string> trimmed_fnames;
+        uint64_t i = 0;
+        for (auto el : fnames) {
+            if (i % 2 == 0) {
+                trimmed_fnames.emplace_back(fnames[i]);
+            }
+            i++;
+        }
+        return make_ready_future<>(); // merge_output_files(trimmed_fnames);
+    });
+}
 
 future<> external_sort() {
     static sstring fname(FNAME);
