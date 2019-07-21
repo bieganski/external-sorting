@@ -28,9 +28,9 @@ using recordVector = std::vector<string>;
 
 static const uint64_t RECORD_SIZE = 4096;
 //static const size_t RECORD_SIZE = 4;
-//static const size_t RAM_AVAILABLE = RECORD_MAX_SIZE * 256 * 1024 * 4; // preprocessing chunk size (4GB)
+static const size_t RAM_AVAILABLE = RECORD_SIZE * 256 * 1024 * 4; // preprocessing chunk size (4GB)
 //static const size_t RAM_AVAILABLE = 8; // TODO nie to
-static const size_t RAM_AVAILABLE = RECORD_SIZE * 10; // TODO nie to
+//static const size_t RAM_AVAILABLE = RECORD_SIZE * 24; // TODO nie to
 
 static const uint64_t MERGING_BLOCK_NUM_RECORDS = RAM_AVAILABLE / RECORD_SIZE / 10; // number of records in merge-results chunks
 
@@ -290,10 +290,13 @@ void prepareMergePhase(uint64_t num_workers) {
 future<> read_and_dump_output_batch(file f1, uint64_t fsize1, file f2, uint64_t fsize2, uint64_t my_num_worker) {
     return read_specific_record_num(f2, fsize2, &OUT_MERGE_BUFFER[my_num_worker],
             MAX_RECORDS_PER_WORKER, TO_BE_TAKEN[my_num_worker]).then([=]() {
-//                uint64_t write_to = fsize1 + TO_BE_TAKEN[my_num_worker] * RECORD_SIZE;
+                uint64_t records_written = OUT_MERGE_BUFFER[my_num_worker].size();
+                if (records_written == 0)
+                    return make_ready_future<>();
                 TO_BE_TAKEN[my_num_worker] += OUT_MERGE_BUFFER[my_num_worker].size();
-                return dump_records_to_specific_pos(f1, &OUT_MERGE_BUFFER[my_num_worker], fsize1).then([](){
-                    OUT_MERGE_BUFFER.clear();
+                return dump_records_to_specific_pos(f1, &OUT_MERGE_BUFFER[my_num_worker], fsize1).then([=](){
+                    OUT_MERGE_BUFFER[my_num_worker].clear();
+                    return read_and_dump_output_batch(f1, fsize1 + records_written * RECORD_SIZE, f2, fsize2, my_num_worker);
                 });
             });
 }
@@ -308,7 +311,9 @@ future<> merge2(string fname1, string fname2, uint64_t my_num_worker) {
                     assert(fsize1 % RECORD_SIZE == 0);
                     assert(fsize2 % RECORD_SIZE == 0);
 //                    cout << "mam dostep do plikow" << fname1 <<", " << fname2 << endl;
-                    return read_and_dump_output_batch(f1, fsize1, f2, fsize2, my_num_worker);
+                    return read_and_dump_output_batch(f1, fsize1, f2, fsize2, my_num_worker).then([=](){
+                        return remove_file(fname2);
+                    });
 //                    return f1.allocate(fsize1, fsize2).then([=]() mutable {
 //
 //                    });
