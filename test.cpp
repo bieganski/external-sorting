@@ -48,7 +48,7 @@ static const uint64_t RECORD_SIZE = 4096;
 //static const size_t RECORD_SIZE = 4;
 //static const size_t RAM_AVAILABLE = RECORD_MAX_SIZE * 256 * 1024 * 4; // preprocessing chunk size (4GB)
 //static const size_t RAM_AVAILABLE = 8; // TODO nie to
-static const size_t RAM_AVAILABLE = RECORD_SIZE * 24; // TODO nie to
+static const size_t RAM_AVAILABLE = RECORD_SIZE * 60; // TODO nie to
 
 static const uint64_t MERGING_BLOCK_NUM_RECORDS = RAM_AVAILABLE / 10 / RECORD_SIZE; // number of records in merge-results chunks
 
@@ -211,6 +211,9 @@ future<stop_iteration> extract_min(uint64_t records_per_chunk) {
     }
     if (!sth_left) {
         cout << "1111\n";
+        if (!OUTPUT_BATCH.empty()) {
+            return dump_output();
+        }
         return make_ready_future<stop_iteration>(stop_iteration::yes);
     }
 
