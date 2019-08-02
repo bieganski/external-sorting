@@ -52,7 +52,8 @@ static const uint64_t RECORD_SIZE = 4096;
 
 
 inline uint64_t RAM_AVAILABLE() {
-    return memory::stats().total_memory();
+//    return memory::stats().total_memory();
+    return RECORD_SIZE * 10;
 }
 
 inline uint64_t NUM_WORKERS() {
@@ -62,6 +63,10 @@ inline uint64_t NUM_WORKERS() {
 
 inline sstring out_chunk_name(uint64_t num_chunk) {
     return sstring(OUT_DIR + std::string("chunk") + std::to_string(num_chunk));
+}
+
+inline sstring tmp_chunk_name(uint64_t num_chunk) {
+    return sstring(TMP_DIR + std::string("chunk") + std::to_string(num_chunk));
 }
 
 inline uint64_t reading_pos(uint64_t num_chunk) {
@@ -91,8 +96,9 @@ future<> read_records(file f, recordVector *save_to, uint64_t start_from, uint64
  * written to disk as temporary file.
  */
 inline uint64_t NUM_RECORDS_TO_READ_PER_THREAD() {
-    uint64_t res = RAM_AVAILABLE() / NUM_WORKERS() / RECORD_SIZE;
-    assert(res > 0 && "Not enough memory!");
+    uint64_t res = RAM_AVAILABLE() / RECORD_SIZE;
+    res /= NUM_WORKERS();
+    assert(res > 0 && "NUM_RECORDS_TO_READ_PER_THREAD: Not enough memory!");
     return res;
 }
 
@@ -113,15 +119,42 @@ future<> read_chunk(file f, uint64_t pos, uint64_t fsize, recordVector& out_vec)
 }
 
 
+future<> dump_records_to_specific_pos(file f, recordVector& records, uint64_t starting_pos, uint64_t num_record = 0) {
+    uint64_t write_pos = starting_pos + num_record * RECORD_SIZE;
+    if (num_record > records.size() - 1)
+        return make_ready_future();
+    return f.dma_write<char>(write_pos, records[num_record].c_str(), RECORD_SIZE).then([=](size_t num) mutable {
+        assert(num == RECORD_SIZE);
+        return dump_records_to_specific_pos(f, records, starting_pos, num_record + 1);
+    });
+}
+
+future<> dump_records(file f, recordVector& records) {
+    return dump_records_to_specific_pos(f, records, 0, 0);
+}
+
+future<> dump_sorted_chunk(uint64_t num_chunk, recordVector& chunk) {
+    sstring fname = tmp_chunk_name(num_chunk);
+    return open_file_dma(fname, open_flags::rw | open_flags::create).then([chunk](file f) mutable {
+        return dump_records(f, chunk);
+    });
+}
+
 future<> worker_job(numVector& chunks_nums, std::string fname, uint64_t fsize) {
-    recordVector to_be_dumped;
     for (uint64_t chunk_num : chunks_nums) {
+        recordVector to_be_dumped;
         file f = open_file_dma(fname, open_flags::ro).get0();
-        do_with(std::move(to_be_dumped), [=](recordVector& out_vec) {
-            return read_chunk(f, reading_pos(chunk_num), fsize, out_vec);
-        }).get();
-        std::cout << to_be_dumped.size() << "\n";
+        read_chunk(f, reading_pos(chunk_num), fsize, to_be_dumped).get();
         f.close();
+        if (to_be_dumped.empty()) {
+            return make_ready_future();
+        }
+        sort(to_be_dumped.begin(), to_be_dumped.end());
+        // TODO wywalalo sie na shardzie 4, na pustym wektorze
+        do_with(std::move(to_be_dumped), [=](recordVector& out_vec) mutable {
+            uint64_t chunk_idx = chunk_num / NUM_RECORDS_TO_READ_PER_THREAD();
+            return dump_sorted_chunk(chunk_idx, to_be_dumped);
+        }).get();
     }
     return make_ready_future();
 }
@@ -132,7 +165,7 @@ future<> worker_job(numVector& chunks_nums, std::string fname, uint64_t fsize) {
  * to disk
  */
 future<> read_and_sort(std::vector<numVector> &workers_chunks_nums, uint64_t fsize) {
-    static uint64_t i = 1; // 0 is for main shard, thus we start from 0 thread
+    static uint64_t i = 1; // 0 is for main shard, thus we start from thread 1
     return parallel_for_each(workers_chunks_nums.begin(), workers_chunks_nums.end(), [fsize](numVector &chunks_nums) {
         return smp::submit_to(i++, [&chunks_nums, fsize] {
             return async([&chunks_nums, fsize] {
@@ -157,19 +190,22 @@ future<> test() {
  */
 std::pair<uint64_t, std::vector<numVector>> chunks_to_be_read(uint64_t fsize) {
     uint64_t NUM_RECORDS = fsize / RECORD_SIZE;
-    uint64_t per_each_thread = NUM_RECORDS / NUM_WORKERS();
-    uint64_t remainder = NUM_RECORDS % NUM_WORKERS();
-
-    std::vector<numVector> res(NUM_WORKERS(), numVector(per_each_thread));
+    numVector read_positions(std::ceil((double)NUM_RECORDS / (double)NUM_RECORDS_TO_READ_PER_THREAD()));
+    static uint64_t i = 0;
+    std::generate(read_positions.begin(), read_positions.end(), [] {
+        auto res = i;
+        i += NUM_RECORDS_TO_READ_PER_THREAD();
+        return res;
+    });
+    i = 0;
+    std::vector<numVector> res(NUM_WORKERS());
     uint64_t num_chunk = 0;
-    for (uint64_t i = 0; i < res.size(); i++) {
-        std::iota(res[i].begin(), res[i].end(), num_chunk);
-        num_chunk += per_each_thread;
+    for (uint64_t pos: read_positions) {
+        res[i % NUM_WORKERS()].emplace_back(pos);
+        i++;
     }
-    for (uint64_t i = 0; i < remainder; i++) {
-        res[i].emplace_back(num_chunk++);
-    }
-    return std::make_pair(num_chunk, res);
+    std::cout << res;
+    return std::make_pair(i, res);
 }
 
 
