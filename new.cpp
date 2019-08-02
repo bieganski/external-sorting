@@ -73,24 +73,6 @@ inline uint64_t reading_pos(uint64_t num_chunk) {
     return num_chunk * RECORD_SIZE;
 }
 
-
-// możemy czytać bezpiecznie do `read_to - 1`
-future<> read_records(file f, recordVector *save_to, uint64_t start_from, uint64_t read_to) {
-    if (read_to < start_from + RECORD_SIZE) {
-        return make_ready_future();
-    }
-    return f.dma_read_exactly<char>(start_from, RECORD_SIZE).then([=](temporary_buffer<char> buf) {
-        // zrobiłem to kopiowanie, bo zarówno buf.prefix jak i buf.trim
-        // jedyne co robią to _size = len, nie zmieniają bufora.
-        std::string trimmed(buf.get(), RECORD_SIZE);
-        assert(trimmed.size() == RECORD_SIZE);
-        assert(trimmed.length() == RECORD_SIZE);
-        save_to->emplace_back(move(trimmed));
-        return read_records(f, save_to, start_from + RECORD_SIZE, read_to);
-    });
-}
-
-
 /**
  * maximal number of record in one sorted chunk
  * written to disk as temporary file.
@@ -108,14 +90,28 @@ inline uint64_t NUM_BYTES_TO_READ_PER_THREAD() {
 }
 
 
+future<> read_records(file f, recordVector& save_to, uint64_t start_from, uint64_t const read_to) {
+    assert(start_from % RECORD_SIZE == 0);
+    assert(read_to % RECORD_SIZE == 0);
+    if (read_to < start_from + RECORD_SIZE) {
+        return make_ready_future();
+    }
+    temporary_buffer<char> buf = f.dma_read_exactly<char>(start_from, RECORD_SIZE).get0();
+    std::string trimmed(buf.get(), RECORD_SIZE);
+    save_to.emplace_back(std::move(trimmed));
+    return read_records(f, save_to, start_from + RECORD_SIZE, read_to);
+}
+
 /**
  * pos - pozycja od której zaczynamy czytanie
- * po przeczytaniu znowu będziemy wołać read_chunk dla pos2 := pos + RAM_AVAILABLE,
- * zatem read_to w funkcji wyżej musi być pos + RAM_AVAILABLE (bo read() czyta do read_to - 1)
+ * po przeczytaniu znowu będziemy wołać read_chunk dla pos2 := pos + NUM_BYTES_TO_READ_PER_THREAD(),
+ * zatem read_to w funkcji wyżej musi być pos + NUM_BYTES_TO_READ_PER_THREAD() (bo read() czyta do read_to - 1)
  */
 future<> read_chunk(file f, uint64_t pos, uint64_t fsize, recordVector& out_vec) {
     uint64_t read_to = std::min(pos + NUM_BYTES_TO_READ_PER_THREAD(), fsize);
-    return read_records(f, &out_vec, pos, read_to);
+    assert(read_to % RECORD_SIZE == 0);
+    assert(pos % RECORD_SIZE == 0);
+    return read_records(f, out_vec, pos, read_to);
 }
 
 
@@ -123,19 +119,20 @@ future<> dump_records_to_specific_pos(file f, recordVector& records, uint64_t st
     uint64_t write_pos = starting_pos + num_record * RECORD_SIZE;
     if (num_record > records.size() - 1)
         return make_ready_future();
-    return f.dma_write<char>(write_pos, records[num_record].c_str(), RECORD_SIZE).then([=](size_t num) mutable {
-        assert(num == RECORD_SIZE);
-        return dump_records_to_specific_pos(f, records, starting_pos, num_record + 1);
-    });
+    size_t num = f.dma_write<char>(write_pos, records[num_record].c_str(), RECORD_SIZE).get0();
+    assert(num == RECORD_SIZE);
+    return dump_records_to_specific_pos(f, records, starting_pos, num_record + 1);
 }
 
 future<> dump_records(file f, recordVector& records) {
-    return dump_records_to_specific_pos(f, records, 0, 0);
+    return async([&records, f] {
+        return dump_records_to_specific_pos(f, records, 0, 0).get0();
+    });
 }
 
 future<> dump_sorted_chunk(uint64_t num_chunk, recordVector& chunk) {
     sstring fname = tmp_chunk_name(num_chunk);
-    return open_file_dma(fname, open_flags::rw | open_flags::create).then([chunk](file f) mutable {
+    return open_file_dma(fname, open_flags::wo | open_flags::create).then([&chunk](file f) mutable {
         return dump_records(f, chunk);
     });
 }
@@ -143,17 +140,16 @@ future<> dump_sorted_chunk(uint64_t num_chunk, recordVector& chunk) {
 future<> worker_job(numVector& chunks_nums, std::string fname, uint64_t fsize) {
     for (uint64_t chunk_num : chunks_nums) {
         recordVector to_be_dumped;
-        file f = open_file_dma(fname, open_flags::ro).get0();
-        read_chunk(f, reading_pos(chunk_num), fsize, to_be_dumped).get();
-        f.close();
-        if (to_be_dumped.empty()) {
-            return make_ready_future();
-        }
-        sort(to_be_dumped.begin(), to_be_dumped.end());
-        // TODO wywalalo sie na shardzie 4, na pustym wektorze
-        do_with(std::move(to_be_dumped), [=](recordVector& out_vec) mutable {
+
+        do_with(std::move(to_be_dumped), [chunk_num, fname, fsize](recordVector& out_vec) mutable {
+            file f = open_file_dma(fname, open_flags::ro).get0();
+            read_chunk(f, reading_pos(chunk_num), fsize, out_vec).get();
+            f.close(); // .get();
+            sort(out_vec.begin(), out_vec.end());
             uint64_t chunk_idx = chunk_num / NUM_RECORDS_TO_READ_PER_THREAD();
-            return dump_sorted_chunk(chunk_idx, to_be_dumped);
+            return do_with(std::move(out_vec), [chunk_idx](recordVector& out) {
+                return dump_sorted_chunk(chunk_idx, out);
+            });
         }).get();
     }
     return make_ready_future();
@@ -169,16 +165,10 @@ future<> read_and_sort(std::vector<numVector> &workers_chunks_nums, uint64_t fsi
     return parallel_for_each(workers_chunks_nums.begin(), workers_chunks_nums.end(), [fsize](numVector &chunks_nums) {
         return smp::submit_to(i++, [&chunks_nums, fsize] {
             return async([&chunks_nums, fsize] {
-                worker_job(chunks_nums, FNAME, fsize);
+                return worker_job(chunks_nums, FNAME, fsize).get0();
             });
         });
     });
-}
-
-
-future<> test() {
-    std::cout << "TEST: " << smp::count;
-    return make_ready_future();
 }
 
 /**
@@ -186,7 +176,7 @@ future<> test() {
  * vector of indices (counting from 0) of records, from which they should start
  * reading chunks. for instance, given [3, 8] vector, thread reads two chunks, first
  * starting at 3 * RECORD_SIZE and second at 8 * RECORD_SIZE position, both containing
- * maximally NUM_RECORDS_TO_READ_PER_THREAD() of records (possibly except the end of the file)
+ * maximally NUM_RECORDS_TO_READ_PER_THREAD() of records
  */
 std::pair<uint64_t, std::vector<numVector>> chunks_to_be_read(uint64_t fsize) {
     uint64_t NUM_RECORDS = fsize / RECORD_SIZE;
@@ -211,11 +201,10 @@ std::pair<uint64_t, std::vector<numVector>> chunks_to_be_read(uint64_t fsize) {
 
 future<> external_sort() {
     static sstring fname(FNAME);
-    static uint64_t i = 0;
     return open_file_dma(fname, open_flags::rw).then([](file f) {
         return f.size().then([f](uint64_t fsize) mutable {
             assert(fsize % RECORD_SIZE == 0 && "Malformed input file error! It's size must be divisible by record size");
-            std::pair<uint64_t, std::vector<numVector>> res = chunks_to_be_read(fsize); // TODO zmien to plz
+            std::pair<uint64_t, std::vector<numVector>> res = chunks_to_be_read(fsize);
             uint64_t NUM_CHUNKS = res.first;
             std::vector<numVector> chunks_nums = res.second;
             return do_with(std::move(chunks_nums), [=](std::vector<numVector>& chunks_nums) mutable {
@@ -240,12 +229,6 @@ int compute(int argc, char **argv) {
 }
 
 
-
-
-/**
- * TODO:
- * assert fsize % RECORD_SIZE == 0, gdzie fsize jest wejściowym plikiem
- */
 int main(int argc, char **argv) {
     uint64_t MERGING_BLOCK_NUM_RECORDS = RAM_AVAILABLE() / RECORD_SIZE / 10;
 
