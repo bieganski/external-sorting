@@ -60,11 +60,11 @@ uint64_t MERGING_BLOCK_NUM_RECORDS; // MERGING_BLOCK_NUM_RECORDS = RAM_AVAILABLE
 
 //static recordVector INPUT_RECORDS{}; // used in splitting-into-chunks preproccessing phase for keeping records to be dumped
 
-static std::vector<recordVector> CHUNKS; // used in merging phase, CHUNKS[i] contains
-
 // vector of some records from tmp/chunk<i> file
 
 //static recordVector OUTPUT_BATCH; // contains part of resulting file (it is to-be-concatenate)
+
+static std::vector<recordVector> CHUNKS; // used in merging phase, CHUNKS[i] contains
 
 static std::vector<uint64_t> TO_BE_TAKEN; // number of record from CHUNKS[i] to be taken in next disc load
 
@@ -382,29 +382,6 @@ future<> external_sort() {
     });
 }
 
-
-future<> test() {
-//    int tab[] = {0,1,2,3,4,5};
-    int tab[] = {5,4,3,2,1,0};
-    return parallel_for_each(tab, tab + 6, [=](int proc) {
-        recordVector a;
-        a.emplace_back(string("kurwa mac"));
-        return do_with(move(a), [](recordVector& b) {
-            cout << b << endl;
-            return make_ready_future();
-        });
-//        return smp::submit_to(proc, [proc]() {
-//            if (proc == 1 || proc == 2) {
-//                for (int j = 0; j < 100; j++ ) {
-//                    malloc(1000);
-//                }
-//            }
-//            cout << memory::stats().total_memory() << "\n";
-////            cout << engine().cpu_id() << endl;
-//            return make_ready_future();
-//        });
-    });
-}
 
 int compute(int argc, char **argv) {
     app_template app;
