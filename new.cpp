@@ -360,25 +360,15 @@ future<stringVector> merge_phase(uint64_t chunks) {
     CHUNKS = std::vector<recordVector>(chunks);
     TO_BE_TAKEN = std::vector<uint64_t>(chunks);
     OUT_FNAMES = std::vector<std::string>();
-    return
-            do_with(std::move(out_batch),
-                    [=](
-                            recordVector &out_vec
-                    ) mutable {
-                        return
-                                init_merge_phase(chunks, RECS_PER_CHUNK
-                                ).then([=]() mutable {
-                                    return repeat([=]() mutable {
-                                        return
-                                                extract_min(RECS_PER_CHUNK, out_vec
-                                                );
-                                    }).then([]() {
-                                        return make_ready_future<std::vector <std::string>>
-                                        (OUT_FNAMES);
-                                    });
-                                });
-                    });
-
+    return do_with(std::move(out_batch), [=](recordVector &out_vec) mutable {
+        return init_merge_phase(chunks, RECS_PER_CHUNK).then([=]() mutable {
+            return repeat([=]() mutable {
+                return extract_min(RECS_PER_CHUNK, out_vec);
+            }).then([]() {
+                return make_ready_future<std::vector <std::string>> (OUT_FNAMES);
+            });
+        });
+    });
 }
 
 
