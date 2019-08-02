@@ -62,22 +62,22 @@ static std::vector<recordVector> OUT_MERGE_BUFFER; // here are put records from 
 
 
 inline uint64_t RAM_AVAILABLE() {
-//    return memory::stats().total_memory();
-    return RECORD_SIZE * 18;
+    return memory::stats().total_memory();
 }
 
 inline uint64_t NUM_WORKERS() {
     return smp::count - 1;
 }
 
-
 inline sstring out_chunk_name(uint64_t const num_chunk) {
     return sstring(OUT_DIR + std::string("chunk") + std::to_string(num_chunk));
 }
 
+
 inline sstring tmp_chunk_name(uint64_t const num_chunk) {
     return sstring(TMP_DIR + std::string("chunk") + std::to_string(num_chunk));
 }
+
 
 inline uint64_t reading_pos(uint64_t const num_chunk) {
     return num_chunk * RECORD_SIZE;
@@ -112,11 +112,7 @@ future<> read_records(file f, recordVector &save_to, uint64_t start_from, uint64
     return read_records(f, save_to, start_from + RECORD_SIZE, read_to);
 }
 
-/**
- * pos - pozycja od której zaczynamy czytanie
- * po przeczytaniu znowu będziemy wołać read_chunk dla pos2 := pos + NUM_BYTES_TO_READ_PER_THREAD(),
- * zatem read_to w funkcji wyżej musi być pos + NUM_BYTES_TO_READ_PER_THREAD() (bo read() czyta do read_to - 1)
- */
+
 future<> read_chunk(file f, uint64_t pos, uint64_t fsize, recordVector &out_vec) {
     uint64_t read_to = std::min(pos + NUM_BYTES_TO_READ_PER_THREAD(), fsize);
     assert(read_to % RECORD_SIZE == 0);
@@ -134,11 +130,13 @@ future<> dump_records_to_specific_pos(file f, recordVector &records, uint64_t st
     return dump_records_to_specific_pos(f, records, starting_pos, num_record + 1);
 }
 
+
 future<> dump_records(file f, recordVector &records) {
     return async([&records, f] {
         return dump_records_to_specific_pos(f, records, 0, 0).get0();
     });
 }
+
 
 future<> dump_sorted_chunk(uint64_t num_chunk, recordVector &chunk) {
     sstring fname = tmp_chunk_name(num_chunk);
@@ -146,6 +144,7 @@ future<> dump_sorted_chunk(uint64_t num_chunk, recordVector &chunk) {
         return dump_records(f, chunk);
     });
 }
+
 
 future<> worker_job(numVector &chunks_nums, std::string fname, uint64_t fsize) {
     for (uint64_t chunk_num : chunks_nums) {
@@ -204,7 +203,6 @@ std::pair<uint64_t, std::vector<numVector>> chunks_to_be_read(uint64_t fsize) {
         res[i % NUM_WORKERS()].emplace_back(pos);
         i++;
     }
-    std::cout << res;
     return std::make_pair(i, res);
 }
 
@@ -222,6 +220,13 @@ inline uint64_t MAX_RECORDS_PER_WORKER() {
     return RAM_AVAILABLE() / RECORD_SIZE / NUM_WORKERS();
 }
 
+/**
+ * UWAGA:
+ * poniższe funkcje są kopiami funkcji z początku pliku, służącymi do odczytu i zapisu rekordów
+ * z pliku. Różnica między nimi polega na tym, że tamte są dla shardów różnych od 0 - są blokujące.
+ */
+
+
 future<> _read_records(file f, recordVector *save_to, uint64_t start_from, uint64_t read_to) {
     if (read_to < start_from + RECORD_SIZE) {
         return make_ready_future();
@@ -238,7 +243,6 @@ future<> _read_records(file f, recordVector *save_to, uint64_t start_from, uint6
 }
 
 
-// może wczytać 0 lub więcej rekordów, maksymalnie `num_rec`
 future<> _read_specific_record_num(file f, uint64_t fsize, recordVector *save_to,
                                   uint64_t num_rec, uint64_t start_reading_from_rec = 0) {
 
@@ -247,11 +251,7 @@ future<> _read_specific_record_num(file f, uint64_t fsize, recordVector *save_to
     return _read_records(f, save_to, start_pos, read_to);
 }
 
-/**
- * @param chunk number of chunk we read from
- * @param num_records number of records to be read
- * @param starting_record record we start reading from
- */
+
 future<> read_chunk_file(uint64_t chunk, uint64_t num_records) {
     sstring fname = tmp_chunk_name(chunk);
     return open_file_dma(fname, open_flags::rw).then([=](file f) mutable {
@@ -277,9 +277,12 @@ future<> _dump_records_to_specific_pos(file f, recordVector& records, uint64_t s
     });
 }
 
+
 future<> _dump_records(file f, recordVector& records) {
     return _dump_records_to_specific_pos(f, records, 0, 0);
 }
+
+
 
 future<stop_iteration> dump_output(recordVector& out_vec) {
     static uint64_t chunk_num = 0;
@@ -345,7 +348,7 @@ future<> init_merge_phase(uint64_t chunks, uint64_t records_per_chunk) {
 }
 
 /**
- * Plik wejśćiowy mamy podzielony na bloki o rozmiarze maksymalnie RAM_AVAILABLE (./tmp/chunkN),
+ * Plik wejściowy mamy podzielony na posortowane bloki.
  * w fazie mergowania bierzemy po kawałku każdego z bloków, następnie szukamy elementów
  * globalnie najmniejszych, które dołączamy do wynikowego bloku, który następnie zapiszemy na dysk
  * (wynikowy plik jest konkatenacją tychże bloków)
@@ -372,8 +375,8 @@ future<stringVector> merge_phase(uint64_t chunks) {
 }
 
 
-void prepareMergePhase(uint64_t num_workers) {
-    assert(MAX_RECORDS_PER_WORKER() > 0 && "Cannot perform multithread merging! Not enough RAM amount");
+void prepare_merge_phase(uint64_t num_workers) {
+    assert(MAX_RECORDS_PER_WORKER() > 0 && "Cannot perform multithread merging! Not enough RAM!");
     for (auto el : OUT_MERGE_BUFFER) {
         el.clear();
     }
@@ -421,8 +424,27 @@ future<> merge2(std::string fname1, std::string fname2, uint64_t my_num_worker) 
 }
 
 
-// Mergowanie wynikowych plików odbywa się równolegle, w każdej fazie
-// dla N plików pracuje N / 2 wątków. (liczba plików zmniejsza się z czasem)
+/**
+ * returns vector of size NUM_WORKERS, each worker given vector of
+ * first indices (i.e. 4 for chunk4 and chunk5 merging).
+ */
+std::vector<numVector> first_indices_per_thread(numVector first_indices) {
+    uint64_t i = 0;
+    uint64_t workers = NUM_WORKERS();
+    std::vector<numVector> res(workers);
+    for (uint64_t el : first_indices) {
+        res[i % workers].emplace_back(el);
+        i++;
+    }
+    return res;
+}
+
+
+/**
+ * Merging of output, globally sorted chunks is pararell.
+ * Each thread is obtained with vector of first indices of files to-be-merged
+ * with it's neighbours, i.a [3,8] implies thread being delegated with merging 3,4 and 8,9 chunks.
+ */
 future<> do_merging(stringVector fnames) {
     numVector first_indices;
     size_t out_files_num = fnames.size();
@@ -432,9 +454,17 @@ future<> do_merging(stringVector fnames) {
         if (i % 2 == 0 && i != out_files_num - 1)
             first_indices.push_back(i);
     }
-    prepareMergePhase(first_indices.size());
-    return parallel_for_each(first_indices.begin(), first_indices.end(), [=](uint64_t num_first) {
-        return merge2(fnames[num_first], fnames[num_first + 1], num_first / 2);
+    prepare_merge_phase(first_indices.size());
+    std::vector<numVector> data_for_threads = first_indices_per_thread(first_indices);
+    uint64_t num_worker_thread = 1;
+    return parallel_for_each(data_for_threads.begin(), data_for_threads.end(), [=](numVector first_indices) mutable {
+        return smp::submit_to(num_worker_thread++, [=] {
+            return async([=] {
+                return do_for_each(first_indices.begin(), first_indices.end(), [=] (uint64_t num_first) {
+                    return merge2(fnames[num_first], fnames[num_first + 1], num_first / 2);
+                }).get0();
+            });
+        });
     });
 }
 
@@ -493,10 +523,8 @@ int compute(int argc, char **argv) {
 
 
 int main(int argc, char **argv) {
-    uint64_t MERGING_BLOCK_NUM_RECORDS = RAM_AVAILABLE() / RECORD_SIZE / 10;
-
     compute(argc, argv);
-    std::cout << "Posortowany plik znajduje się w katalogu " << OUT_DIR << " pod nazwą chunk0" << std::endl;
+    std::cout << "Sorting done! Result can be found in " << OUT_DIR << " directory and name 'chunk0'" << std::endl;
     return 0;
 }
 
