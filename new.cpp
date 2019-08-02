@@ -59,8 +59,30 @@ inline uint64_t NUM_WORKERS() {
     return smp::count - 1;
 }
 
+
 inline sstring out_chunk_name(uint64_t num_chunk) {
     return sstring(OUT_DIR + std::string("chunk") + std::to_string(num_chunk));
+}
+
+inline uint64_t reading_pos(uint64_t num_chunk) {
+    return num_chunk * RECORD_SIZE;
+}
+
+
+// możemy czytać bezpiecznie do `read_to - 1`
+future<> read_records(file f, recordVector *save_to, uint64_t start_from, uint64_t read_to) {
+    if (read_to < start_from + RECORD_SIZE) {
+        return make_ready_future();
+    }
+    return f.dma_read_exactly<char>(start_from, RECORD_SIZE).then([=](temporary_buffer<char> buf) {
+        // zrobiłem to kopiowanie, bo zarówno buf.prefix jak i buf.trim
+        // jedyne co robią to _size = len, nie zmieniają bufora.
+        std::string trimmed(buf.get(), RECORD_SIZE);
+        assert(trimmed.size() == RECORD_SIZE);
+        assert(trimmed.length() == RECORD_SIZE);
+        save_to->emplace_back(move(trimmed));
+        return read_records(f, save_to, start_from + RECORD_SIZE, read_to);
+    });
 }
 
 
@@ -75,16 +97,48 @@ inline uint64_t NUM_RECORDS_TO_READ_PER_THREAD() {
 }
 
 
+inline uint64_t NUM_BYTES_TO_READ_PER_THREAD() {
+    return NUM_RECORDS_TO_READ_PER_THREAD() * RECORD_SIZE;
+}
+
+
+/**
+ * pos - pozycja od której zaczynamy czytanie
+ * po przeczytaniu znowu będziemy wołać read_chunk dla pos2 := pos + RAM_AVAILABLE,
+ * zatem read_to w funkcji wyżej musi być pos + RAM_AVAILABLE (bo read() czyta do read_to - 1)
+ */
+future<> read_chunk(file f, uint64_t pos, uint64_t fsize, recordVector& out_vec) {
+    uint64_t read_to = std::min(pos + NUM_BYTES_TO_READ_PER_THREAD(), fsize);
+    return read_records(f, &out_vec, pos, read_to);
+}
+
+
+future<> worker_job(numVector& chunks_nums, std::string fname, uint64_t fsize) {
+    recordVector to_be_dumped;
+    for (uint64_t chunk_num : chunks_nums) {
+        file f = open_file_dma(fname, open_flags::ro).get0();
+        do_with(std::move(to_be_dumped), [=](recordVector& out_vec) {
+            return read_chunk(f, reading_pos(chunk_num), fsize, out_vec);
+        }).get();
+        std::cout << to_be_dumped.size() << "\n";
+        f.close();
+    }
+    return make_ready_future();
+}
+
 
 /**
  * delegates to each worker task of reading it's chunks, sorting them and saving
  * to disk
  */
-future<> read_and_sort(std::vector<numVector>& workers_chunks_nums) {
-    return parallel_for_each(workers_chunks_nums.begin(), workers_chunks_nums.end(), [](numVector chunks_nums) {
-        std::cout << "thread: " << std::to_string(engine().cpu_id()) << "-- bede czytal" << chunks_nums << "\n";
-//        return read_chunk_file(chunks_nums);
-        return make_ready_future();
+future<> read_and_sort(std::vector<numVector> &workers_chunks_nums, uint64_t fsize) {
+    static uint64_t i = 1; // 0 is for main shard, thus we start from 0 thread
+    return parallel_for_each(workers_chunks_nums.begin(), workers_chunks_nums.end(), [fsize](numVector &chunks_nums) {
+        return smp::submit_to(i++, [&chunks_nums, fsize] {
+            return async([&chunks_nums, fsize] {
+                worker_job(chunks_nums, FNAME, fsize);
+            });
+        });
     });
 }
 
@@ -129,8 +183,8 @@ future<> external_sort() {
             uint64_t NUM_CHUNKS = res.first;
             std::vector<numVector> chunks_nums = res.second;
             return do_with(std::move(chunks_nums), [=](std::vector<numVector>& chunks_nums) mutable {
-                return f.close().then([&chunks_nums]{
-                    return read_and_sort(chunks_nums);
+                return f.close().then([&chunks_nums, fsize]{
+                    return read_and_sort(chunks_nums, fsize);
                 });
             });
         });
